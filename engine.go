@@ -75,6 +75,7 @@ func (e *Engine) Initialization() Initialization { return e.initialization }
 
 // Timings is a diagnostic breakdown of one request into disjoint stages. Inference includes tensor creation/destruction,
 // synchronous Run, device-to-host retrieval, an owned copy and finite validation.
+// SynthesizeStream excludes time spent in the consumer callback.
 type Timings struct {
 	PreparationSeconds    float64 `json:"preparation_seconds"`
 	InferenceSeconds      float64 `json:"inference_seconds"`
@@ -194,7 +195,8 @@ type Request struct {
 	Trim     bool    `json:"trim"`     // trim leading/trailing silence per chunk
 }
 
-// ChunkAudio is the diagnostic per-chunk output behind Result.Samples.
+// ChunkAudio is one chunk's owned output, delivered by SynthesizeStream or
+// retained in Result.Chunks. Samples returns the audio selected by its trim bounds.
 type ChunkAudio struct {
 	Chunk
 	Raw       []float32 `json:"-"` // untrimmed model output, owned by the caller
@@ -275,31 +277,19 @@ func (e *Engine) SynthesizePrepared(ctx context.Context, chunks []Chunk, trim bo
 
 func (e *Engine) synthesizeChunks(ctx context.Context, chunks []Chunk, trim bool) (Result, error) {
 	result := Result{SampleRate: SampleRate}
-	for i, chunk := range chunks {
-		if err := ctx.Err(); err != nil {
-			return Result{}, err
-		}
-		startTime := time.Now()
-		raw, err := e.run(chunk)
-		result.Timings.InferenceSeconds += time.Since(startTime).Seconds()
-		if err != nil {
-			return Result{}, fmt.Errorf("chunk %d: %w", i, err)
-		}
-		if err := ctx.Err(); err != nil {
-			return Result{}, err
-		}
-		startTime = time.Now()
-		start, end := 0, len(raw)
-		if trim {
-			start, end = audio.TrimBounds(raw)
-		}
-		if end <= start {
-			return Result{}, fmt.Errorf("chunk %d is empty after trimming", i)
-		}
-		result.Samples = append(result.Samples, raw[start:end]...)
-		result.Chunks = append(result.Chunks, ChunkAudio{chunk, raw, start, end})
-		result.Timings.PostprocessingSeconds += time.Since(startTime).Seconds()
+	var collectionSeconds float64
+	timings, err := streamChunks(ctx, chunks, trim, e.run, func(chunk ChunkAudio) error {
+		start := time.Now()
+		result.Samples = append(result.Samples, chunk.Samples()...)
+		result.Chunks = append(result.Chunks, chunk)
+		collectionSeconds += time.Since(start).Seconds()
+		return nil
+	})
+	if err != nil {
+		return Result{}, err
 	}
+	result.Timings = timings
+	result.Timings.PostprocessingSeconds += collectionSeconds
 	return result, nil
 }
 

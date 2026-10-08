@@ -83,10 +83,72 @@ func SplitPhonemes(phonemes string) ([]string, error) {
 }
 
 func prepare(phonemes, voice string, speed float32, voices *assets.Voices, vocab map[rune]int64) ([]Chunk, error) {
+	return prepareWithOptions(phonemes, voice, speed, voices, vocab, StreamOptions{})
+}
+
+// splitStreamPhonemes uses the original packing unless a limit is requested.
+// Custom limits prefer the last punctuation boundary within the budget, then
+// whitespace, then a Unicode code-point boundary. No non-whitespace is dropped.
+func splitStreamPhonemes(phonemes string, options StreamOptions) ([]string, error) {
+	if options.MaxChunkPhonemes < 0 || options.MaxChunkPhonemes > MaxPhonemes {
+		return nil, fmt.Errorf("MaxChunkPhonemes must be between 0 and %d", MaxPhonemes)
+	}
+	maximum := options.MaxChunkPhonemes
+	if maximum == 0 {
+		maximum = MaxPhonemes
+	}
+	if options.FirstChunkPhonemes < 0 || options.FirstChunkPhonemes > maximum {
+		return nil, fmt.Errorf("FirstChunkPhonemes must be between 0 and %d", maximum)
+	}
+	if options == (StreamOptions{}) {
+		return SplitPhonemes(phonemes)
+	}
+	if !utf8.ValidString(phonemes) {
+		return nil, errors.New("phonemes must be valid UTF-8")
+	}
+	runes := []rune(strings.TrimSpace(phonemes))
+	if len(runes) == 0 {
+		return nil, errors.New("phonemes are empty")
+	}
+	limit := maximum
+	if options.FirstChunkPhonemes > 0 {
+		limit = options.FirstChunkPhonemes
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		cut := len(runes)
+		if cut > limit {
+			cut = limit
+			punctuation, space := 0, 0
+			for i := 0; i <= limit; i++ {
+				if unicode.IsSpace(runes[i]) {
+					space = i
+				}
+				if i < limit && strings.ContainsRune(".,!?;", runes[i]) {
+					punctuation = i + 1
+				}
+			}
+			if punctuation > 0 {
+				cut = punctuation
+			} else if space > 0 {
+				cut = space
+			}
+		}
+		chunks = append(chunks, strings.TrimSpace(string(runes[:cut])))
+		runes = runes[cut:]
+		for len(runes) > 0 && unicode.IsSpace(runes[0]) {
+			runes = runes[1:]
+		}
+		limit = maximum
+	}
+	return chunks, nil
+}
+
+func prepareWithOptions(phonemes, voice string, speed float32, voices *assets.Voices, vocab map[rune]int64, options StreamOptions) ([]Chunk, error) {
 	if !(speed >= 0.5 && speed <= 2) {
 		return nil, errors.New("speed must be finite and between 0.5 and 2.0")
 	}
-	parts, err := SplitPhonemes(phonemes)
+	parts, err := splitStreamPhonemes(phonemes, options)
 	if err != nil {
 		return nil, err
 	}

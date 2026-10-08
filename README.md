@@ -42,6 +42,8 @@ func speak(ctx context.Context) (err error) {
 - `ListVoices(path)` lists sorted archive names without initializing ORT.
 - `Prepare` creates padded tokens, selected style rows and speed values.
 - `SynthesizePrepared` consumes validated token/style/speed tensors directly.
+- `SynthesizeStream` is an alternative to `Synthesize`: it delivers completed
+  chunks to a callback without accumulating a whole-request waveform.
 - `ModelInfo` returns inspected tensor metadata. `Initialization` and
   `Result.Timings` expose loading and preparation/inference/postprocessing stages.
 - Results are owned Go audio buffers, with raw per-chunk samples and trim bounds.
@@ -55,6 +57,74 @@ func speak(ctx context.Context) (err error) {
 
 The Kokoro v1.0 vocabulary is embedded; `VocabPath` overrides it only for a
 custom model.
+
+## Streaming audio
+
+Use `Synthesize` for a complete waveform, or opt into `SynthesizeStream` when an
+application can consume audio incrementally. Each callback receives one completed
+model chunk, after optional silence trimming and before the next native run.
+`chunk.Samples()` is the trimmed mono float32 audio at `kokoro.SampleRate` (24 kHz);
+it aliases the caller-owned `chunk.Raw` buffer and remains valid after the
+callback and synthesis return.
+
+```go
+// playback is an application-owned, bounded queue drained concurrently by an
+// audio consumer. Run synthesis on a producer goroutine if playback is on the
+// calling goroutine. Reuse the initialized engine across requests.
+playback := make(chan []float32, 2)
+// ... start the playback consumer before calling SynthesizeStream ...
+timings, err := engine.SynthesizeStream(ctx, kokoro.Request{
+    Phonemes: phonemes, Voice: "af_heart", Speed: 1, Trim: true,
+}, kokoro.StreamOptions{
+    FirstChunkPhonemes: 80,
+    MaxChunkPhonemes:   160,
+}, func(chunk kokoro.ChunkAudio) error {
+    select {
+    case playback <- chunk.Samples():
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+})
+close(playback) // this producer owns the channel; the consumer drains it
+// Handle err even if some chunks have already played. timings excludes callback time.
+```
+
+The example limits are starting points to tune against playback underruns and
+prosody, not measured optimal values. `StreamOptions{}` preserves the exact
+chunk boundaries and preparation used by `Synthesize`. With custom limits:
+
+- `MaxChunkPhonemes` is 1–509; zero selects 509.
+- `FirstChunkPhonemes` optionally imposes a smaller first-chunk limit. Zero uses
+  the effective maximum; it cannot exceed that maximum.
+- Limits count unpadded Unicode code points, including spaces and punctuation.
+  A split prefers the last `.,!?;` boundary within the limit, then whitespace,
+  then a code-point boundary. Short remaining input is kept together. Boundary
+  whitespace is trimmed; all non-whitespace phonemes are retained.
+- Each chunk selects its style row using its actual unpadded token count. Smaller
+  chunks add native runs and can change timing/prosody. Delivery still waits for
+  a complete chunk, so a callback alone does not accelerate a short one-chunk request.
+
+The callback is synchronous and applies backpressure. Queue audio for a separate
+consumer to overlap playback with the next chunk's synthesis. The engine creates
+no background goroutines and retains no delivered audio or aggregate waveform;
+the consumer controls how much audio it keeps. All input chunks are prepared and
+validated before the first native run.
+
+**Errors and lifetime:** a callback error stops further inference and delivery;
+it is wrapped with the zero-based chunk index and supports `errors.Is`/`errors.As`.
+Context cancellation is checked around native runs and callbacks, including after
+the final callback. Native inference cannot be interrupted mid-run. Previously
+delivered audio remains valid on any error. A blocking callback must observe the
+context itself, and the playback consumer should cancel it if playback fails.
+Returned timings include work completed before failure but exclude callback time.
+
+Requests and `Close` remain serialized for the entire stream, including callbacks.
+**Do not call back into the same engine from a callback**; that can deadlock.
+Close the engine after streaming returns. `WriteWAV` writes a complete WAV per
+call; concatenating those files is not a continuous PCM stream. Playback/network
+framing belongs to the application. See `ExampleEngine_SynthesizeStream` for a
+complete producer/consumer example.
 
 ## ONNX Runtime ownership
 
@@ -92,7 +162,8 @@ CPU uses one intra/inter-op thread by default, sequential graph
 execution and full optimization. Set `Threads` for intra-op parallelism.
 
 Close every engine. Requests and Close on an engine are serialized; native Run
-cannot be interrupted mid-call. Whole-request audio stays in memory.
+cannot be interrupted mid-call. `Synthesize` retains whole-request audio;
+`SynthesizeStream` delivers owned chunks without collecting the waveform.
 Metadata inspection currently creates a temporary session before the inference
 session, so loading timings include **two graph loads**. `Verbose` exposes node
 placement; CUDA graphs still contain some CPU operators.
