@@ -24,21 +24,25 @@ func testConfig(t *testing.T) Config {
 
 func TestRealModel(t *testing.T) {
 	c := testConfig(t)
+	if !nativeSubprocess(t) {
+		return
+	}
 	bad := c
+	bad.ORTLibrary = filepath.Join(t.TempDir(), "missing-onnxruntime.so")
+	if _, err := New(bad); err == nil {
+		t.Fatal("accepted missing runtime")
+	}
+	if ort.IsInitialized() {
+		t.Fatal("failed runtime initialization left an environment")
+	}
+	// The runtime initializes before the model loads and is retained afterwards.
+	bad = c
 	bad.ModelPath = filepath.Join(t.TempDir(), "broken.onnx")
 	if err := os.WriteFile(bad.ModelPath, []byte("not ONNX"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := New(bad); err == nil {
 		t.Fatal("accepted broken model")
-	}
-	if ort.IsInitialized() {
-		t.Fatal("failed init leaked runtime")
-	}
-	bad = c
-	bad.ORTLibrary = filepath.Join(t.TempDir(), "missing-onnxruntime.so")
-	if _, err := New(bad); err == nil {
-		t.Fatal("accepted missing runtime")
 	}
 	e, err := New(c)
 	if err != nil {
@@ -105,7 +109,7 @@ func TestRealModel(t *testing.T) {
 	if _, err := e.Synthesize(ctx, request); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	// Multiple leases: closing one engine must not invalidate the other.
+	// Multiple engines: closing one must not invalidate the other.
 	other, err := New(c)
 	if err != nil {
 		t.Fatal(err)
@@ -139,10 +143,11 @@ func TestRealModel(t *testing.T) {
 	if err := other.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if ort.IsInitialized() {
-		t.Fatal("last Close leaked environment")
+	if !ort.IsInitialized() {
+		t.Fatal("last Close destroyed the environment")
 	}
-	// Successful reinitialization after all sessions, options and tensors are gone.
+	// Reuse after the last engine closed. ortenv v0.1.0 reloaded the runtime here,
+	// which crashes CUDA providers (androiddrew/ortenv#2).
 	again, err := New(c)
 	if err != nil {
 		t.Fatal(err)
@@ -175,6 +180,9 @@ func TestModelMetadata(t *testing.T) {
 
 func TestCallerOwnedEnvironment(t *testing.T) {
 	c := testConfig(t)
+	if !nativeSubprocess(t) {
+		return
+	}
 	library := c.ORTLibrary
 	c.ORTLibrary = ""
 	if _, err := New(c); !errors.Is(err, ErrNotInitialized) {

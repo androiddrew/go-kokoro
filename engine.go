@@ -12,7 +12,6 @@ import (
 	"github.com/androiddrew/go-kokoro/internal/assets"
 	"github.com/androiddrew/go-kokoro/internal/audio"
 	"github.com/androiddrew/go-kokoro/internal/ortruntime"
-	"github.com/androiddrew/ortenv"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -35,9 +34,9 @@ const (
 // Config locates the model assets and configures the session.
 type Config struct {
 	// ORTLibrary is an ONNX Runtime library path or OS-loader name. When set, the
-	// engine shares the environment through an ortenv lease. When empty, the
-	// caller owns the environment and must initialize it before New and destroy
-	// it only after Close.
+	// engine initializes the environment through ortenv, which retains it until
+	// process exit. When empty, the caller owns the environment and must
+	// initialize it before New and destroy it only after Close.
 	ORTLibrary string
 	ModelPath  string // kokoro-v1.0.onnx
 	VoicesPath string // voices-v1.0.bin
@@ -57,7 +56,6 @@ type Engine struct {
 	vocab          map[rune]int64
 	info           ModelInfo
 	closed         bool
-	lease          *ortenv.Lease
 	initialization Initialization
 }
 
@@ -108,22 +106,16 @@ func New(c Config) (_ *Engine, err error) {
 		return nil, err
 	}
 	start = time.Now()
-	if e.lease, err = ortruntime.Acquire(c.ORTLibrary); err != nil {
+	if err = ortruntime.Init(c.ORTLibrary); err != nil {
 		return nil, err
 	}
 	e.initialization.RuntimeSeconds = time.Since(start).Seconds()
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, e.lease.Close())
-		}
-	}()
 	start = time.Now()
 	defer func() { e.initialization.ModelSeconds = time.Since(start).Seconds() }()
 	options, err := sessionOptions(c)
 	if err != nil {
 		return nil, err
 	}
-	// Defer ordering matters: destroy options/session before releasing the lease.
 	defer func() {
 		err = errors.Join(err, options.Destroy())
 		if err != nil && e.session != nil {
@@ -141,7 +133,8 @@ func New(c Config) (_ *Engine, err error) {
 	return e, nil
 }
 
-// Close destroys the session and releases any ortenv lease. It is idempotent.
+// Close destroys the session. It is idempotent. The ONNX Runtime environment
+// stays initialized for other engines and later calls to New.
 func (e *Engine) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -151,7 +144,7 @@ func (e *Engine) Close() error {
 	e.closed = true
 	err := e.session.Destroy()
 	e.session, e.voices, e.vocab = nil, nil, nil
-	return errors.Join(err, e.lease.Close())
+	return err
 }
 
 // Voices returns the sorted voice names, or nil after Close.

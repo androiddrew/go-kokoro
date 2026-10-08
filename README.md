@@ -130,10 +130,11 @@ complete producer/consumer example.
 
 ONNX Runtime has one environment per process, shared by every model in it.
 
-- **Set `ORTLibrary`** (simplest): the engine takes a lease from
-  [`github.com/androiddrew/ortenv`](https://github.com/androiddrew/ortenv), which
-  starts the environment on first use and shuts it down when the last lease closes.
-  Every component using ortenv in the process must use the same library selector.
+- **Set `ORTLibrary`** (simplest): the engine initializes the environment through
+  [`github.com/androiddrew/ortenv`](https://github.com/androiddrew/ortenv) on first
+  use. The environment stays loaded until process exit, so closing the last engine
+  never unloads the runtime. Every component using ortenv in the process must use
+  the same library selector, and nothing may destroy the environment ortenv owns.
 - **Leave `ORTLibrary` empty** when your application already manages ONNX Runtime
   itself (directly through `onnxruntime_go` or through ortenv). Initialize the
   environment before `New` and destroy it only after `Close`; otherwise `New`
@@ -179,7 +180,9 @@ go build ./cmd/inference-probe
 Set `KOKORO_TEST_ASSETS` to the directory holding the model and voices, and
 `KOKORO_TEST_ORT` to an ONNX Runtime library, then run `go test -race ./...`.
 Unit tests need neither. With only `KOKORO_TEST_ASSETS`, the voice and `Prepare`
-fixture tests also run; the model tests skip without `KOKORO_TEST_ORT`. The
+fixture tests also run; the model tests skip without `KOKORO_TEST_ORT`. Tests
+that load ONNX Runtime, or need it unloaded, each run in a fresh subprocess
+because ortenv keeps the environment loaded until process exit. The
 fixtures in `testdata/` hold the exact token, style and speed inputs expected
 for phoneme strings produced by go-g2p. CI runs everything against the official
 ONNX Runtime 1.22.0 release.

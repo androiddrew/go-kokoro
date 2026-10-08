@@ -249,7 +249,11 @@ func TestStreamRejectsInvalidRequestsBeforeDelivery(t *testing.T) {
 }
 
 func TestRealModelStream(t *testing.T) {
-	e, err := New(testConfig(t))
+	c := testConfig(t)
+	if !nativeSubprocess(t) {
+		return
+	}
+	e, err := New(c)
 	if err != nil {
 		t.Fatal(err)
 	}
