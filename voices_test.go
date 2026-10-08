@@ -17,6 +17,9 @@ func TestListVoicesWithoutRuntime(t *testing.T) {
 	if dir == "" {
 		t.Skip("set KOKORO_TEST_ASSETS for voice archive integration")
 	}
+	if !nativeSubprocess(t) {
+		return
+	}
 	if ort.IsInitialized() {
 		t.Fatal("test requires no live native environment")
 	}

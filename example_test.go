@@ -71,3 +71,42 @@ func ExampleListVoices() {
 	}
 	fmt.Println(len(voices), "voices, e.g.", voices[0])
 }
+
+// Stream into a bounded queue so playback can overlap the next native run.
+func ExampleEngine_SynthesizeStream() {
+	engine, err := kokoro.New(kokoro.Config{
+		ORTLibrary: "libonnxruntime.so",
+		ModelPath:  "assets/kokoro/kokoro-v1.0.onnx",
+		VoicesPath: "assets/kokoro/voices-v1.0.bin",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer engine.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	playback := make(chan []float32, 2)
+	done := make(chan error, 1)
+	go func() {
+		_, err := engine.SynthesizeStream(ctx, kokoro.Request{
+			Phonemes: "həlˈO wˈɜɹld! həlˈO əɡˈɛn.", Voice: "af_heart", Speed: 1, Trim: true,
+		}, kokoro.StreamOptions{FirstChunkPhonemes: 16, MaxChunkPhonemes: 80}, func(chunk kokoro.ChunkAudio) error {
+			select {
+			case playback <- chunk.Samples():
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		close(playback)
+		done <- err
+	}()
+	for samples := range playback {
+		// Send these samples to the application's audio device or transport.
+		// On a consumer failure, cancel() and wait for done before closing engine.
+		fmt.Printf("received %.2fs of audio\n", float64(len(samples))/kokoro.SampleRate)
+	}
+	if err := <-done; err != nil {
+		log.Print(err) // earlier audio may already have been played
+	}
+}

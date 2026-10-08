@@ -12,7 +12,6 @@ import (
 	"github.com/androiddrew/go-kokoro/internal/assets"
 	"github.com/androiddrew/go-kokoro/internal/audio"
 	"github.com/androiddrew/go-kokoro/internal/ortruntime"
-	"github.com/androiddrew/ortenv"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -35,9 +34,9 @@ const (
 // Config locates the model assets and configures the session.
 type Config struct {
 	// ORTLibrary is an ONNX Runtime library path or OS-loader name. When set, the
-	// engine shares the environment through an ortenv lease. When empty, the
-	// caller owns the environment and must initialize it before New and destroy
-	// it only after Close.
+	// engine initializes the environment through ortenv, which retains it until
+	// process exit. When empty, the caller owns the environment and must
+	// initialize it before New and destroy it only after Close.
 	ORTLibrary string
 	ModelPath  string // kokoro-v1.0.onnx
 	VoicesPath string // voices-v1.0.bin
@@ -57,7 +56,6 @@ type Engine struct {
 	vocab          map[rune]int64
 	info           ModelInfo
 	closed         bool
-	lease          *ortenv.Lease
 	initialization Initialization
 }
 
@@ -75,6 +73,7 @@ func (e *Engine) Initialization() Initialization { return e.initialization }
 
 // Timings is a diagnostic breakdown of one request into disjoint stages. Inference includes tensor creation/destruction,
 // synchronous Run, device-to-host retrieval, an owned copy and finite validation.
+// SynthesizeStream excludes time spent in the consumer callback.
 type Timings struct {
 	PreparationSeconds    float64 `json:"preparation_seconds"`
 	InferenceSeconds      float64 `json:"inference_seconds"`
@@ -107,22 +106,16 @@ func New(c Config) (_ *Engine, err error) {
 		return nil, err
 	}
 	start = time.Now()
-	if e.lease, err = ortruntime.Acquire(c.ORTLibrary); err != nil {
+	if err = ortruntime.Init(c.ORTLibrary); err != nil {
 		return nil, err
 	}
 	e.initialization.RuntimeSeconds = time.Since(start).Seconds()
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, e.lease.Close())
-		}
-	}()
 	start = time.Now()
 	defer func() { e.initialization.ModelSeconds = time.Since(start).Seconds() }()
 	options, err := sessionOptions(c)
 	if err != nil {
 		return nil, err
 	}
-	// Defer ordering matters: destroy options/session before releasing the lease.
 	defer func() {
 		err = errors.Join(err, options.Destroy())
 		if err != nil && e.session != nil {
@@ -140,7 +133,8 @@ func New(c Config) (_ *Engine, err error) {
 	return e, nil
 }
 
-// Close destroys the session and releases any ortenv lease. It is idempotent.
+// Close destroys the session. It is idempotent. The ONNX Runtime environment
+// stays initialized for other engines and later calls to New.
 func (e *Engine) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -150,7 +144,7 @@ func (e *Engine) Close() error {
 	e.closed = true
 	err := e.session.Destroy()
 	e.session, e.voices, e.vocab = nil, nil, nil
-	return errors.Join(err, e.lease.Close())
+	return err
 }
 
 // Voices returns the sorted voice names, or nil after Close.
@@ -194,7 +188,8 @@ type Request struct {
 	Trim     bool    `json:"trim"`     // trim leading/trailing silence per chunk
 }
 
-// ChunkAudio is the diagnostic per-chunk output behind Result.Samples.
+// ChunkAudio is one chunk's owned output, delivered by SynthesizeStream or
+// retained in Result.Chunks. Samples returns the audio selected by its trim bounds.
 type ChunkAudio struct {
 	Chunk
 	Raw       []float32 `json:"-"` // untrimmed model output, owned by the caller
@@ -275,31 +270,19 @@ func (e *Engine) SynthesizePrepared(ctx context.Context, chunks []Chunk, trim bo
 
 func (e *Engine) synthesizeChunks(ctx context.Context, chunks []Chunk, trim bool) (Result, error) {
 	result := Result{SampleRate: SampleRate}
-	for i, chunk := range chunks {
-		if err := ctx.Err(); err != nil {
-			return Result{}, err
-		}
-		startTime := time.Now()
-		raw, err := e.run(chunk)
-		result.Timings.InferenceSeconds += time.Since(startTime).Seconds()
-		if err != nil {
-			return Result{}, fmt.Errorf("chunk %d: %w", i, err)
-		}
-		if err := ctx.Err(); err != nil {
-			return Result{}, err
-		}
-		startTime = time.Now()
-		start, end := 0, len(raw)
-		if trim {
-			start, end = audio.TrimBounds(raw)
-		}
-		if end <= start {
-			return Result{}, fmt.Errorf("chunk %d is empty after trimming", i)
-		}
-		result.Samples = append(result.Samples, raw[start:end]...)
-		result.Chunks = append(result.Chunks, ChunkAudio{chunk, raw, start, end})
-		result.Timings.PostprocessingSeconds += time.Since(startTime).Seconds()
+	var collectionSeconds float64
+	timings, err := streamChunks(ctx, chunks, trim, e.run, func(chunk ChunkAudio) error {
+		start := time.Now()
+		result.Samples = append(result.Samples, chunk.Samples()...)
+		result.Chunks = append(result.Chunks, chunk)
+		collectionSeconds += time.Since(start).Seconds()
+		return nil
+	})
+	if err != nil {
+		return Result{}, err
 	}
+	result.Timings = timings
+	result.Timings.PostprocessingSeconds += collectionSeconds
 	return result, nil
 }
 

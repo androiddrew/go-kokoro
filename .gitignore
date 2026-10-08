@@ -1,5 +1,6 @@
 /bin/
 /artifacts/
+/tmp/
 /.assets/
 /go.work
 /go.work.sum
