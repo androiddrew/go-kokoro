@@ -22,5 +22,10 @@ Original code is Apache-2.0 (LICENSE/NOTICE). Retained notices are under
   Koniwa `tnc` (CC BY 3.0) and SIWIS (CC BY 4.0), with redistributed assets.
 - Optional NVIDIA CUDA/cuDNN installations are also user-managed, not repo assets.
 
-No pronunciation backend is included in this module. Model and voice binaries
-are external assets rather than files relicensed by the Go code license.
+The `kokoro` package includes no pronunciation backend. The `text` subpackage
+uses **github.com/androiddrew/go-g2p v0.2.0** and **github.com/androiddrew/go-ttsnorm
+v0.1.0** as external Go dependencies (see their own notices; go-g2p's optional
+eSpeak-ng fallback runs a separately installed GPL-3.0-or-later program). Its
+pipeline moved here from kokoro-run's `internal/engine` and `internal/textprep`
+(Apache-2.0, Copyright 2026 Drew Bednar). Model and voice binaries are external
+assets rather than files relicensed by the Go code license.

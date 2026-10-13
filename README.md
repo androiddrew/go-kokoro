@@ -3,7 +3,9 @@
 `github.com/androiddrew/go-kokoro` (package `kokoro`) synthesizes phonemes with
 Kokoro v1.0 through ONNX Runtime. It is independent of text frontends and CLIs:
 to go from English text to phonemes, use
-[`github.com/androiddrew/go-g2p`](https://github.com/androiddrew/go-g2p).
+[`github.com/androiddrew/go-g2p`](https://github.com/androiddrew/go-g2p), or
+use the [`text`](#speaking-text) subpackage, which does that and streams the
+audio. The `kokoro` package itself imports neither go-g2p nor go-ttsnorm.
 
 You need an installed ONNX Runtime and two downloads, the Kokoro model (325 MB)
 and voices (28 MB); see [ASSETS.md](ASSETS.md) for links and checksums. The
@@ -125,6 +127,56 @@ Close the engine after streaming returns. `WriteWAV` writes a complete WAV per
 call; concatenating those files is not a continuous PCM stream. Playback/network
 framing belongs to the application. See `ExampleEngine_SynthesizeStream` for a
 complete producer/consumer example.
+
+## Speaking text
+
+`github.com/androiddrew/go-kokoro/text` (package `text`) speaks US and UK
+English text. `Pipeline.Stream` prepares the text with
+[go-ttsnorm](https://github.com/androiddrew/go-ttsnorm) (markdown as prose;
+numbers, dates, times, money, units and URLs as words), splits it into
+sentences, pronounces each with go-g2p and its neural or eSpeak-ng fallback,
+and yields each Kokoro run's audio as it completes. It is the pipeline
+[kokoro-run](https://github.com/androiddrew/kokoro-run) serves.
+
+```go
+p, err := text.New(text.Config{
+    ORTLibrary: "libonnxruntime.so", // shared by the frontend and Kokoro
+    Synthesis: kokoro.Config{
+        ModelPath:  "/assets/kokoro/kokoro-v1.0.onnx",
+        VoicesPath: "/assets/kokoro/voices-v1.0.bin",
+    },
+})
+if err != nil { return err }
+defer p.Close()
+for chunk, err := range p.Stream(ctx, text.Request{
+    Text: "The meeting is at 3:05 p.m. Don't be late!", Voice: "af_heart", Speed: 1, Trim: true,
+    Prep:     text.PrepOptions{Markdown: true, Normalize: true},
+    Chunking: kokoro.StreamOptions{FirstChunkPhonemes: 80, MaxChunkPhonemes: 160}, // optional
+}) {
+    if err != nil { return err }
+    playback <- chunk.PCM // mono float32 at text.SampleRate; chunk.Text is its sentence
+}
+```
+
+- The voice's prefix selects the dialect: `a*` voices are US English, `b*` UK
+  (`VoiceDialect`). Other Kokoro languages are rejected.
+- `Request.Chunking` passes `kokoro.StreamOptions` to every sentence. The zero
+  value runs whole sentences, which is what kokoro-run does. Smaller runs start
+  audio sooner and make cancellation take effect sooner, since a run in
+  progress can't be interrupted.
+- Unknown words are spoken as far as the fallback can pronounce them and
+  reported in `Chunk.Diagnostics`; `Request.Strict` returns
+  `ErrPronunciation` instead. `Gap` adds silence before each sentence after
+  the first.
+- Cancelling `ctx` stops the stream between model runs. Breaking out of the
+  loop stops it too and leaves the pipeline usable.
+- Each sentence's audio is delivered while the Kokoro engine is locked, as with
+  `SynthesizeStream`: don't call `p.Synthesis` from the loop body.
+- `Prepare` and `NewFrontend` are available on their own. Build a `Pipeline`
+  from its `Frontend` and `Synthesis` fields to load them yourself.
+
+The tests skip unless `KOKORO_TEST_ORT` and `KOKORO_TEST_ASSETS` are set, like
+the root package's.
 
 ## ONNX Runtime ownership
 
